@@ -134,7 +134,8 @@ if (actionAPI?.onClicked) {
         return;
       }
       try {
-        const recipe = await createRecipeViaApi(tab.url, cfg.mealieUrl, cfg.mealieApiToken);
+        const html = await capturePageHtml(tab.id);
+        const recipe = await createRecipeViaApi(tab.url, cfg.mealieUrl, cfg.mealieApiToken, html);
         if (cfg.openEditMode && recipe) {
           await openRecipeEditPage(recipe, cfg.mealieUrl, cfg.mealieApiToken, cfg.enableParse, cfg.mealieGroupSlug);
         }
@@ -220,7 +221,42 @@ async function checkLoginCookie(mealieUrl) {
   }
 }
 
-async function createRecipeViaApi(url, mealieUrl, mealieApiToken) {
+// Submits page HTML already rendered in the user's browser directly to Mealie,
+// bypassing Mealie's own server-side fetch. Used as a fallback for sites that
+// block server-side scraping (bot walls, JS challenges) but load fine for a
+// real browser.
+async function createRecipeViaHtml(html, url, mealieUrl, mealieApiToken) {
+  const fetchUrl = new URL('/api/recipes/create/html-or-json', mealieUrl).href;
+  const resp = await fetch(fetchUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${mealieApiToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ data: html, url })
+  });
+  if (!resp.ok) throw new Error('Failed to send recipe from captured HTML');
+  return resp.json();
+}
+
+// Captures the rendered HTML of a tab via the scripting permission, scoped to
+// the active tab the user just interacted with (no persistent host permission
+// required). Returns null if capture isn't possible.
+async function capturePageHtml(tabId) {
+  if (!tabId || !api.scripting?.executeScript) return null;
+  try {
+    const results = await api.scripting.executeScript({
+      target: { tabId },
+      func: () => document.documentElement.outerHTML
+    });
+    return results?.[0]?.result || null;
+  } catch (e) {
+    console.warn('Send2Mealie: Could not capture page HTML for fallback', e);
+    return null;
+  }
+}
+
+async function createRecipeViaApi(url, mealieUrl, mealieApiToken, html) {
   try {
     // API endpoint - requires token
     const fetchUrl = new URL('/api/recipes/create/url', mealieUrl).href;
@@ -239,6 +275,16 @@ async function createRecipeViaApi(url, mealieUrl, mealieApiToken) {
     api.notifications?.create({ type: "basic", title: "Sent to Mealie", iconUrl: "icons/icon_128.png", message: "Recipe URL submitted." });
     return recipe;
   } catch (e) {
+    if (html) {
+      try {
+        const recipe = await createRecipeViaHtml(html, url, mealieUrl, mealieApiToken);
+        api.notifications?.create({ type: "basic", title: "Sent to Mealie", iconUrl: "icons/icon_128.png", message: "Recipe imported from page content." });
+        return recipe;
+      } catch (e2) {
+        api.notifications?.create({ type: "basic", title: "Mealie error", iconUrl: "icons/icon_128.png", message: "Failed to send recipe" });
+        throw e2;
+      }
+    }
     api.notifications?.create({ type: "basic", title: "Mealie error", iconUrl: "icons/icon_128.png", message: "Failed to send recipe" });
     throw e;
   }
@@ -342,7 +388,7 @@ async function openRecipeEditPage(recipe, mealieUrl, mealieApiToken, enableParse
   }
 }
 
-async function handleContextMenuSend(pageUrl) {
+async function handleContextMenuSend(pageUrl, tabId) {
   const cfg = await api.storage.sync.get(["mealieUrl", "mealieApiToken", "mealieGroupSlug", "enableDuplicateCheck", "openEditMode", "enableParse"]);
   const { mealieUrl, mealieApiToken, mealieGroupSlug, enableDuplicateCheck, openEditMode } = cfg || {};
   const enableParse = cfg?.enableParse === true;
@@ -399,7 +445,8 @@ async function handleContextMenuSend(pageUrl) {
     }
   }
 
-  let recipe = await createRecipeViaApi(pageUrl, mealieUrl, mealieApiToken);
+  const html = await capturePageHtml(tabId);
+  let recipe = await createRecipeViaApi(pageUrl, mealieUrl, mealieApiToken, html);
   recipe = await waitForRecipeSlug(recipe, mealieUrl, mealieApiToken);
   await openRecipeEditPage(recipe, mealieUrl, mealieApiToken, enableParse, mealieGroupSlug);
 }
@@ -429,17 +476,26 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return;
           }
         }
-        const fetchUrl = new URL('/api/recipes/create/url', mealieUrl).href;
-        const resp = await fetch(fetchUrl, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${mealieApiToken}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ url: msg.url })
-        });
-        if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
-        let recipe = await resp.json();
+        let recipe;
+        try {
+          const fetchUrl = new URL('/api/recipes/create/url', mealieUrl).href;
+          const resp = await fetch(fetchUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${mealieApiToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ url: msg.url })
+          });
+          if (!resp.ok) throw new Error(`HTTP error! status: ${resp.status}`);
+          recipe = await resp.json();
+        } catch (e) {
+          if (!msg.html) throw e;
+          // Server-side fetch likely hit a bot wall; retry with the page HTML
+          // the content script already captured, which already passed it.
+          console.warn('Send2Mealie: URL import failed, retrying with captured page HTML', e);
+          recipe = await createRecipeViaHtml(msg.html, msg.url, mealieUrl, mealieApiToken);
+        }
         if (openEditMode) {
           // Wait for recipe to be fully processed before opening edit page
           recipe = await waitForRecipeSlug(recipe, mealieUrl, mealieApiToken);
@@ -542,7 +598,7 @@ if (menuAPI?.onClicked) {
     if (info?.menuItemId !== 'send2mealie') return;
     const pageUrl = info?.pageUrl || tab?.url;
     if (!pageUrl) return;
-    handleContextMenuSend(pageUrl).catch((e) => {
+    handleContextMenuSend(pageUrl, tab?.id).catch((e) => {
       console.error('Send2Mealie: Context menu handler failed', e);
     });
   });

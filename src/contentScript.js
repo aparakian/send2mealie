@@ -39,7 +39,7 @@ const api = typeof browser !== 'undefined' ? browser : chrome;
     btn.style.background = "#9ACD32";
     btn.style.opacity = "0.7";
     btn.style.pointerEvents = "none";
-    api.runtime.sendMessage({ type: "createViaApi", url: location.href }, (response) => {
+    api.runtime.sendMessage({ type: "createViaApi", url: location.href, html: document.documentElement.outerHTML }, (response) => {
       btn.style.opacity = "1";
       btn.style.pointerEvents = "auto";
       if (response?.success) {
