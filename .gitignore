@@ -15,3 +15,6 @@ quickstart.md
 # IDE history and state
 .drift/
 .history/
+
+# build size report written by size-plugin
+size-plugin.json
